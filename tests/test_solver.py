@@ -1,6 +1,7 @@
 """Unit tests: mocked transport, real local verification logic."""
 import json
 import math
+import os
 import unittest
 
 from mathsolver_help import MathSolver, eval_expression, SolverError
@@ -115,3 +116,14 @@ class TestClient(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(not os.environ.get("SMOKE_API_KEY"), "smoke: set SMOKE_API_KEY to run")
+class TestSmokeRealAPI(unittest.TestCase):
+    def test_round_trip(self):
+        solver = MathSolver(api_key=os.environ["SMOKE_API_KEY"],
+                            base_url=os.environ.get("SMOKE_BASE_URL", "https://api.openai.com/v1"))
+        r = solver.solve("2x + 3 = 11, solve for x")
+        print("smoke:", {"answer": r.answer, "verified": r.verified, "retries": r.retries})
+        self.assertTrue(r.verified)
+        self.assertEqual(r.answer, 4)

@@ -1,0 +1,20 @@
+name: smoke (real API)
+on:
+  workflow_dispatch: {}
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    env:
+      SMOKE_API_KEY: ${{ secrets.SMOKE_API_KEY }}
+      SMOKE_BASE_URL: ${{ secrets.SMOKE_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require secret
+        run: |
+          if [ -z "$SMOKE_API_KEY" ]; then
+            echo "::error::SMOKE_API_KEY secret not configured (repo/org Settings - Secrets - Actions)"
+            exit 1
+          fi
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: PYTHONPATH=src python -m unittest discover -s tests -v
