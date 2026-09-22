@@ -214,63 +214,84 @@ def _default_transport(url: str, body: dict, api_key: str) -> str:
 
 
 # ---------------------------------------------------------------------
-# solve
+# MathSolver client (instantiate once, solve many)
 # ---------------------------------------------------------------------
 
-def solve(problem: str, api_key: str = "", base_url: str = "https://api.openai.com/v1",
-          model: str = "gpt-4o-mini", transport: Optional[Callable[[str, dict, str], str]] = None) -> SolverResult:
-    """Solve a math problem with a BYOK OpenAI-compatible API key.
+class MathSolver:
+    """BYOK client for an OpenAI-compatible endpoint.
+
+    Usage::
+
+        from mathsolver_help import MathSolver
+
+        solver = MathSolver(api_key="sk-...", base_url="https://api.openai.com/v1")
+        result = solver.solve("2x + 3 = 11, solve for x")
+        # OpenAI-compatible alternatives: DeepSeek, Groq, Moonshot, local Ollama/vLLM, ...
 
     The answer is only ``verified=True`` when the model's verification
     expression independently re-evaluates (locally) to the same number.
     """
-    if not api_key:
-        raise SolverError("NO_API_KEY", "api_key is required (BYOK: bring your own key)")
-    if not isinstance(problem, str) or not problem.strip():
-        raise SolverError("NO_PROBLEM", "problem must be a non-empty string")
-    transport = transport or _default_transport
-    url = base_url.rstrip("/") + "/chat/completions"
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": problem},
-    ]
-    call = lambda: transport(url, {"model": model, "messages": messages, "temperature": 0}, api_key)  # noqa: E731
+    def __init__(self, api_key: str, base_url: str = "https://api.openai.com/v1",
+                 model: str = "gpt-4o-mini", timeout: int = 60,
+                 transport: Optional[Callable[[str, dict, str], str]] = None):
+        if not api_key:
+            raise SolverError("NO_API_KEY", "api_key is required (BYOK: bring your own key)")
+        if not base_url or not base_url.startswith(("http://", "https://")):
+            raise SolverError("BAD_BASE_URL", "base_url must be an http(s) URL, e.g. https://api.deepseek.com/v1")
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = timeout
+        self._transport = transport
 
-    try:
-        parsed = _parse_solver_json(call())
-    except SolverError as err:
-        if err.code != "INVALID_JSON":
-            raise
-        messages.append({"role": "assistant", "content": "invalid JSON"})
-        messages.append({"role": "user", "content": "Your reply was not valid JSON. Reply again with the exact strict JSON shape."})
-        parsed = _parse_solver_json(call())  # second failure raises
+    def solve(self, problem: str) -> SolverResult:
+        if not isinstance(problem, str) or not problem.strip():
+            raise SolverError("NO_PROBLEM", "problem must be a non-empty string")
+        transport = self._transport or _default_transport
+        url = f"{self.base_url}/chat/completions"
+        api_key, model = self.api_key, self.model
 
-    def attempt(p: dict) -> tuple:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": problem},
+        ]
+        call = lambda: transport(url, {"model": model, "messages": messages, "temperature": 0}, api_key)  # noqa: E731
+
         try:
-            ev = eval_expression(p["expression"])
-        except SolverError:
-            return None, False
-        return ev, _numerically_equal(ev, p["answer"])
+            parsed = _parse_solver_json(call())
+        except SolverError as err:
+            if err.code != "INVALID_JSON":
+                raise
+            messages.append({"role": "assistant", "content": "invalid JSON"})
+            messages.append({"role": "user", "content": "Your reply was not valid JSON. Reply again with the exact strict JSON shape."})
+            parsed = _parse_solver_json(call())  # second failure throws
 
-    evaluated, verified = attempt(parsed)
-    retries = 0
-    if not verified:
-        retries = 1
-        messages.append({"role": "assistant", "content": json.dumps(parsed)})
-        messages.append({"role": "user", "content":
-                         f"Your verification expression evaluated to {evaluated if evaluated is not None else 'an error'}, "
-                         f"which does not match your answer {parsed['answer']}. "
-                         "Re-derive the problem carefully and reply again with the same strict JSON shape."})
-        try:
-            second = _parse_solver_json(call())
-            ev2, ok2 = attempt(second)
-            if ev2 is not None:
-                evaluated = ev2
-            if ok2:
-                parsed, verified = second, True
-        except SolverError:
-            pass  # keep first attempt; verified stays False
+        def attempt(p: dict) -> tuple:
+            try:
+                ev = eval_expression(p["expression"])
+            except SolverError:
+                return None, False
+            return ev, _numerically_equal(ev, p["answer"])
 
-    return SolverResult(answer=parsed["answer"], steps=parsed["steps"], expression=parsed["expression"],
-                        evaluated=evaluated, verified=verified, retries=retries)
+        evaluated, verified = attempt(parsed)
+        retries = 0
+        if not verified:
+            retries = 1
+            messages.append({"role": "assistant", "content": json.dumps(parsed)})
+            messages.append({"role": "user", "content":
+                             f"Your verification expression evaluated to {evaluated if evaluated is not None else 'an error'}, "
+                             f"which does not match your answer {parsed['answer']}. "
+                             "Re-derive the problem carefully and reply again with the same strict JSON shape."})
+            try:
+                second = _parse_solver_json(call())
+                ev2, ok2 = attempt(second)
+                if ev2 is not None:
+                    evaluated = ev2
+                if ok2:
+                    parsed, verified = second, True
+            except SolverError:
+                pass  # keep first attempt; verified stays False
+
+        return SolverResult(answer=parsed["answer"], steps=parsed["steps"], expression=parsed["expression"],
+                            evaluated=evaluated, verified=verified, retries=retries)
