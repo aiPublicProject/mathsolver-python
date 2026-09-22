@@ -5,7 +5,9 @@ BYOK AI math solver with independent verification — bring your own OpenAI-comp
 ## How it works
 
 ```
-solve(problem, { apiKey, baseUrl?, model? })
+// instantiate once with your own credentials, solve many
+solver = new Client(apiKey, baseUrl?, model?)
+result = solver.solve(problem)
   → { answer, steps[], expression, evaluated, verified, retries }
 ```
 
