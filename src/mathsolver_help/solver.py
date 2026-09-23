@@ -1,25 +1,42 @@
-"""Core solver: BYOK call to an OpenAI-compatible endpoint + local verification."""
+"""Core solver: BYOK call to an OpenAI-compatible endpoint + execution-based verification.
+
+v0.2 (PAL-style): the model never states the answer. It returns a small
+JavaScript-like PROGRAM; this package executes the program deterministically
+and the execution output IS the answer. For equations, a CHECK expression
+({x} placeholder) must evaluate to 0 when the computed answer is substituted
+back into the original equation.
+"""
 from __future__ import annotations
 
 import json
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 from urllib.request import Request, urlopen
 
 SYSTEM_PROMPT = "\n".join([
     "You are a precise math solver.",
     "Reply with STRICT JSON only, no markdown fences, in this exact shape:",
-    '{"answer": <number>, "steps": [<string>, ...], "verification": {"expression": "<string>"}}',
+    '{"program": "<string>", "steps": [<string>, ...], "check": "<string>"}',
     "Rules:",
-    '- "answer" must be a single number (the final result).',
-    '- "steps" must be an array of short plain-language explanation strings.',
-    '- "verification.expression" must be a pure arithmetic expression that',
-    "  evaluates to the answer. Allowed: numbers, + - * / % ^ ( ), and the",
-    "  functions abs sqrt sin cos tan ln log exp floor ceil round min max",
-    "  (log is base 10, ln is natural), and the constants pi and e.",
-    "- The expression must recompute the answer independently.",
+    '- "program" is a small JavaScript-like program that computes the final answer.',
+    "  One statement per line (or ; separated). Allowed statements:",
+    "      let NAME = EXPRESSION",
+    "      result = EXPRESSION",
+    "  EXPRESSIONs may use numbers, + - * / % ^ ( ), the functions",
+    "  abs sqrt sin cos tan ln log exp floor ceil round min max",
+    "  (log is base 10, ln is natural), the constants pi and e, and any",
+    "  variable defined by an earlier let. The value assigned to result",
+    "  is the answer. Never state the answer as a number in text.",
+    '- "steps" is an array of short plain-language explanation strings.',
+    '- "check" is a verification expression containing the placeholder {x}.',
+    "  After solving, {x} is replaced by the computed answer and the whole",
+    "  expression must evaluate to 0.",
+    "  For equations, substitute the answer back into the original equation",
+    '  (e.g. 2x+3=11 -> "2*{x}+3-11").',
+    "  For arithmetic, recompute via a different path and subtract the answer",
+    '  (e.g. 15% of 80 -> "80*15/100-{x}"). Provide "check" whenever possible.',
 ])
 
 
@@ -66,10 +83,11 @@ def _tokenize(src: str):
     return tokens
 
 
-def eval_expression(src: str) -> float:
+def eval_expression(src: str, env: Optional[dict] = None) -> float:
     """Evaluate a pure arithmetic expression string. Raises SolverError on anything else."""
     if not isinstance(src, str) or not src.strip():
         raise SolverError("EXPR_EMPTY", "empty expression")
+    env = env or {}
     tokens = _tokenize(src)
     pos = 0
 
@@ -124,7 +142,10 @@ def eval_expression(src: str) -> float:
         if kind == "num":
             return eat()[1]
         if kind == "id":
-            name = eat()[1].lower()
+            raw = eat()[1]
+            if raw in env:
+                return float(env[raw])
+            name = raw.lower()
             if peek() and peek()[0] == "(":
                 eat("(")
                 args = [parse_expr()]
@@ -155,18 +176,62 @@ def eval_expression(src: str) -> float:
 
 
 # ---------------------------------------------------------------------
-# JSON extraction
+# Program interpreter + check
 # ---------------------------------------------------------------------
 
 @dataclass
 class SolverResult:
     answer: float
     steps: List[str] = field(default_factory=list)
-    expression: str = ""
-    evaluated: Optional[float] = None
+    program: str = ""
+    check: Optional[str] = None
+    check_value: Optional[float] = None
     verified: bool = False
     retries: int = 0
 
+
+def run_program(src: str) -> float:
+    """Execute a model-generated JS-dialect program (let / assignment / result)."""
+    if not isinstance(src, str) or not src.strip():
+        raise SolverError("PROGRAM_EMPTY", "empty program")
+    env: dict = {}
+    result_defined = False
+    last_value = None
+    lines = [ln.strip() for ln in re.split(r"[\n;]+", src) if ln.strip()]
+    if not lines:
+        raise SolverError("PROGRAM_EMPTY", "empty program")
+    for line in lines:
+        m = re.match(r"^let\s+([a-zA-Z_]\w*)\s*=\s*([\s\S]+)$", line)
+        if m:
+            env[m.group(1)] = eval_expression(m.group(2), env)
+            if m.group(1) == "result":
+                result_defined = True
+            continue
+        m = re.match(r"^([a-zA-Z_]\w*)\s*=\s*([\s\S]+)$", line)
+        if m:
+            env[m.group(1)] = eval_expression(m.group(2), env)
+            if m.group(1) == "result":
+                result_defined = True
+            continue
+        last_value = eval_expression(line, env)
+    if result_defined:
+        return float(env["result"])
+    if last_value is not None:
+        return float(last_value)
+    raise SolverError("PROGRAM_NO_RESULT", "program produced no result")
+
+
+def run_check(check_src: str, answer: float) -> Tuple[float, bool]:
+    """Substitute {x} with the computed answer; passes when value ~ 0."""
+    substituted = re.sub(r"\{\s*x\s*\}", "(" + repr(answer) + ")", str(check_src), flags=re.I)
+    value = eval_expression(substituted)
+    passed = abs(value) <= 1e-6 * max(1.0, abs(answer))
+    return value, passed
+
+
+# ---------------------------------------------------------------------
+# JSON extraction
+# ---------------------------------------------------------------------
 
 def _parse_solver_json(text: str) -> dict:
     m = re.search(r"\{[\s\S]*\}", str(text))
@@ -176,18 +241,16 @@ def _parse_solver_json(text: str) -> dict:
         data = json.loads(m.group(0))
     except json.JSONDecodeError:
         raise SolverError("INVALID_JSON", "model reply was not valid JSON")
-    answer = data.get("answer")
-    if isinstance(answer, str):
-        m2 = re.search(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", answer)
-        answer = float(m2.group(0)) if m2 else None
-    if not isinstance(answer, (int, float)):
-        raise SolverError("INVALID_JSON", "model JSON is missing a numeric answer")
-    expr = (data.get("verification") or {}).get("expression")
-    if not isinstance(expr, str):
-        raise SolverError("INVALID_JSON", "model JSON is missing verification.expression")
+    program = data.get("program")
+    if not isinstance(program, str):
+        raise SolverError("INVALID_JSON", "model JSON is missing program")
+    check = data.get("check")
     steps = data.get("steps")
-    return {"answer": float(answer), "steps": [str(s) for s in steps] if isinstance(steps, list) else [],
-            "expression": expr}
+    return {
+        "program": program,
+        "steps": [str(s) for s in steps] if isinstance(steps, list) else [],
+        "check": check if isinstance(check, str) and check.strip() else None,
+    }
 
 
 def _numerically_equal(a: float, b: float, rel_tol: float = 1e-6) -> bool:
@@ -214,7 +277,7 @@ def _default_transport(url: str, body: dict, api_key: str) -> str:
 
 
 # ---------------------------------------------------------------------
-# MathSolver client (instantiate once, solve many)
+# Client (instantiate once, solve many)
 # ---------------------------------------------------------------------
 
 class MathSolver:
@@ -226,10 +289,10 @@ class MathSolver:
 
         solver = MathSolver(api_key="sk-...", base_url="https://api.openai.com/v1")
         result = solver.solve("2x + 3 = 11, solve for x")
-        # OpenAI-compatible alternatives: DeepSeek, Groq, Moonshot, local Ollama/vLLM, ...
-
-    The answer is only ``verified=True`` when the model's verification
-    expression independently re-evaluates (locally) to the same number.
+        # result.answer comes from executing the model-generated program
+        # locally — never from a number the model stated.
+        # result.verified is True only when the check expression passes
+        # (equations: answer substituted back satisfies the original equation).
     """
 
     def __init__(self, api_key: str, base_url: str = "https://api.openai.com/v1",
@@ -256,7 +319,9 @@ class MathSolver:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": problem},
         ]
-        call = lambda: transport(url, {"model": model, "messages": messages, "temperature": 0}, api_key)  # noqa: E731
+
+        def call() -> str:
+            return transport(url, {"model": model, "messages": messages, "temperature": 0}, api_key)
 
         try:
             parsed = _parse_solver_json(call())
@@ -267,31 +332,35 @@ class MathSolver:
             messages.append({"role": "user", "content": "Your reply was not valid JSON. Reply again with the exact strict JSON shape."})
             parsed = _parse_solver_json(call())  # second failure throws
 
-        def attempt(p: dict) -> tuple:
+        def attempt(p: dict) -> dict:
             try:
-                ev = eval_expression(p["expression"])
-            except SolverError:
-                return None, False
-            return ev, _numerically_equal(ev, p["answer"])
+                answer = run_program(p["program"])
+                check_value = None
+                verified = False
+                if p["check"]:
+                    check_value, verified = run_check(p["check"], answer)
+                return {"ok": True, "answer": answer, "check_value": check_value, "verified": verified}
+            except SolverError as err:
+                return {"ok": False, "error": err}
 
-        evaluated, verified = attempt(parsed)
+        outcome = attempt(parsed)
         retries = 0
-        if not verified:
+        if not outcome["ok"] or not outcome["verified"]:
             retries = 1
+            reason = (
+                f"program failed to execute ({outcome['error'].code}: {outcome['error']})"
+                if not outcome["ok"]
+                else f"check evaluated to {outcome['check_value']} instead of 0"
+            )
             messages.append({"role": "assistant", "content": json.dumps(parsed)})
             messages.append({"role": "user", "content":
-                             f"Your verification expression evaluated to {evaluated if evaluated is not None else 'an error'}, "
-                             f"which does not match your answer {parsed['answer']}. "
+                             f"Your submission failed verification: {reason}. "
                              "Re-derive the problem carefully and reply again with the same strict JSON shape."})
-            try:
-                second = _parse_solver_json(call())
-                ev2, ok2 = attempt(second)
-                if ev2 is not None:
-                    evaluated = ev2
-                if ok2:
-                    parsed, verified = second, True
-            except SolverError:
-                pass  # keep first attempt; verified stays False
+            parsed = _parse_solver_json(call())
+            outcome = attempt(parsed)
+            if not outcome["ok"]:
+                raise outcome["error"]  # PROGRAM_* persisted after retry
 
-        return SolverResult(answer=parsed["answer"], steps=parsed["steps"], expression=parsed["expression"],
-                            evaluated=evaluated, verified=verified, retries=retries)
+        return SolverResult(answer=outcome["answer"], steps=parsed["steps"], program=parsed["program"],
+                            check=parsed["check"], check_value=outcome["check_value"],
+                            verified=outcome["verified"], retries=retries)
