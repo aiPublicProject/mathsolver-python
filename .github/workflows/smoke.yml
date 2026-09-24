@@ -7,6 +7,7 @@ jobs:
     env:
       SMOKE_API_KEY: ${{ secrets.SMOKE_API_KEY }}
       SMOKE_BASE_URL: ${{ secrets.SMOKE_BASE_URL }}
+      SMOKE_MODEL: ${{ secrets.SMOKE_MODEL }}
     steps:
       - uses: actions/checkout@v4
       - name: Require secret

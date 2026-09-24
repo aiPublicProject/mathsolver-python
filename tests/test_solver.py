@@ -179,8 +179,9 @@ class TestClient(unittest.TestCase):
 @unittest.skipIf(not os.environ.get("SMOKE_API_KEY"), "smoke: set SMOKE_API_KEY to run")
 class TestSmokeRealAPI(unittest.TestCase):
     def test_round_trip(self):
-        solver = MathSolver(api_key=os.environ["SMOKE_API_KEY"],
-                            base_url=os.environ.get("SMOKE_BASE_URL", "https://api.openai.com/v1"))
+        base_url = os.environ.get("SMOKE_BASE_URL") or "https://api.openai.com/v1"
+        model = os.environ.get("SMOKE_MODEL") or "gpt-4o-mini"
+        solver = MathSolver(api_key=os.environ["SMOKE_API_KEY"], base_url=base_url, model=model)
         r = solver.solve("2x + 3 = 11, solve for x")
         print("smoke:", {"answer": r.answer, "verified": r.verified, "retries": r.retries})
         self.assertTrue(r.verified)
