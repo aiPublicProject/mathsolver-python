@@ -4,17 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mathsolver-help"
-version = "0.1.0"
-description = "BYOK AI math solver with independent verification — bring your own OpenAI-compatible API key, answers verified by local expression evaluation."
+version = "0.2.0"
+description = "BYOK AI math solver with execution-based verification (PAL-style) — bring your own OpenAI-compatible API key; the answer is computed locally by executing a model-generated program, never taken from a number the model stated."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-keywords = ["math", "solver", "ai", "byok", "verification", "step-by-step", "education"]
+keywords = ["math", "solver", "ai", "byok", "verification", "step-by-step", "education", "pal", "program-of-thought"]
 authors = [{ name = "mathsolver.help" }]
 
 [project.urls]
 Homepage = "https://mathsolver.help"
-Repository = "https://github.com/mathsolver-help/mathsolver-python"
+Repository = "https://github.com/aiPublicProject/mathsolver-python"
 
 [project.optional-dependencies]
 dev = ["pytest"]
